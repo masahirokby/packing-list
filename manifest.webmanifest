@@ -1,0 +1,17 @@
+{
+  "name": "パッキングリスト",
+  "short_name": "Packing",
+  "description": "旅行・出張の持ち物チェックリスト",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#fffdf8",
+  "theme_color": "#146b53",
+  "icons": [
+    {
+      "src": "./icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
