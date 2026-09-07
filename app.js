@@ -197,36 +197,75 @@ const cloudRow = {
   })
 };
 
-const syncMutation = async (table, rows) => {
-  saveLocal();
-  if (!supabase || !ui.user) return;
+const QUEUE_KEY = 'packing-list-queue-v1';
+const TABLE_LOOKUP = {
+  master_items: id => data.masterItems.find(candidate => candidate.id === id),
+  trips: id => data.trips.find(candidate => candidate.id === id),
+  trip_items: id => data.tripItems.find(candidate => candidate.id === id)
+};
+const TABLE_ROW = { master_items: cloudRow.master, trips: cloudRow.trip, trip_items: cloudRow.tripItem };
+
+const loadQueue = () => {
+  try {
+    const saved = JSON.parse(localStorage.getItem(QUEUE_KEY));
+    return Array.isArray(saved) ? saved : [];
+  } catch {
+    return [];
+  }
+};
+
+let queue = loadQueue();
+let flushing = false;
+const saveQueue = () => localStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
+
+// Keeping only the latest pending operation per row means the queue always
+// converges on current state instead of replaying a history of edits.
+const enqueue = (table, op, id) => {
+  queue = queue.filter(entry => !(entry.table === table && entry.id === id));
+  queue.push({ table, op, id });
+  saveQueue();
+};
+
+const flushQueue = async () => {
+  if (flushing || !supabase || !ui.user || !navigator.onLine || queue.length === 0) return;
+  flushing = true;
   ui.syncText = '同期中…';
   render();
-  const payload = Array.isArray(rows) ? rows : [rows];
-  const { error } = await supabase.from(table).upsert(payload);
-  ui.syncText = error ? '端末に保存・同期待ち' : 'クラウドに保存済み';
+  while (queue.length > 0) {
+    const entry = queue[0];
+    let error = null;
+    if (entry.op === 'delete') {
+      ({ error } = await supabase.from(entry.table).delete().eq('id', entry.id));
+    } else {
+      const row = TABLE_LOOKUP[entry.table](entry.id);
+      if (!row) {
+        queue.shift();
+        saveQueue();
+        continue;
+      }
+      ({ error } = await supabase.from(entry.table).upsert(TABLE_ROW[entry.table](row)));
+    }
+    if (error) break;
+    queue.shift();
+    saveQueue();
+  }
+  ui.syncText = queue.length ? '端末に保存・同期待ち' : 'クラウドに保存済み';
+  flushing = false;
   render();
 };
 
-const deleteCloud = async (table, id) => {
+const persistAndQueue = (table, ids) => {
   saveLocal();
-  if (!supabase || !ui.user) return;
-  const { error } = await supabase.from(table).delete().eq('id', id);
-  ui.syncText = error ? '端末に保存・同期待ち' : 'クラウドに保存済み';
+  (Array.isArray(ids) ? ids : [ids]).forEach(id => enqueue(table, 'upsert', id));
   render();
+  flushQueue();
 };
 
-const syncAll = async () => {
-  if (!supabase || !ui.user || !navigator.onLine) return;
-  ui.syncText = '同期中…';
+const persistAndQueueDelete = (table, id) => {
+  saveLocal();
+  enqueue(table, 'delete', id);
   render();
-  const results = await Promise.all([
-    data.masterItems.length ? supabase.from('master_items').upsert(data.masterItems.map(cloudRow.master)) : Promise.resolve({ error: null }),
-    data.trips.length ? supabase.from('trips').upsert(data.trips.map(cloudRow.trip)) : Promise.resolve({ error: null }),
-    data.tripItems.length ? supabase.from('trip_items').upsert(data.tripItems.map(cloudRow.tripItem)) : Promise.resolve({ error: null })
-  ]);
-  ui.syncText = results.some(result => result.error) ? '端末に保存・同期待ち' : 'クラウドに保存済み';
-  render();
+  flushQueue();
 };
 
 const authScreen = () => `
@@ -443,17 +482,18 @@ const handleTripSubmit = async form => {
     const existingMasterIds = new Set(existing.map(item => item.masterItemId));
     const additions = activeMasterItems().filter(item => item.isOptional && selected.has(item.id) && !existingMasterIds.has(item.id));
     data.tripItems.push(...additions.map(item => ({ id: crypto.randomUUID(), tripId: trip.id, masterItemId: item.id, name: item.name, category: item.category, bag: item.bag, isOptional: true, sortOrder: item.sortOrder, checked: false })));
-    await syncMutation('trips', cloudRow.trip(trip));
-    await syncMutation('trip_items', itemsForTrip(trip.id).map(cloudRow.tripItem));
-    if (supabase && removedOptionalIds.length) await supabase.from('trip_items').delete().in('id', removedOptionalIds);
+    persistAndQueue('trips', trip.id);
+    persistAndQueue('trip_items', itemsForTrip(trip.id).map(tripItem => tripItem.id));
+    removedOptionalIds.forEach(itemId => enqueue('trip_items', 'delete', itemId));
+    flushQueue();
   } else {
     trip = { id: crypto.randomUUID(), name, startDate, endDate, status: 'preparing', createdAt: new Date().toISOString() };
     const tripItems = createTripItems(trip.id, optionalIds);
     data.trips.push(trip);
     data.tripItems.push(...tripItems);
     data.activeTripId = trip.id;
-    await syncMutation('trips', cloudRow.trip(trip));
-    await syncMutation('trip_items', tripItems.map(cloudRow.tripItem));
+    persistAndQueue('trips', trip.id);
+    persistAndQueue('trip_items', tripItems.map(tripItem => tripItem.id));
   }
   ui.view = 'packing';
   ui.editingTripId = null;
@@ -475,13 +515,13 @@ const handleItemSubmit = async form => {
     Object.assign(item, values);
     if (formData.get('applyPreparing') === 'on') {
       data.tripItems.filter(tripItem => tripItem.masterItemId === item.id && !tripItem.checked).forEach(tripItem => Object.assign(tripItem, values));
-      await syncMutation('trip_items', data.tripItems.filter(tripItem => tripItem.masterItemId === item.id).map(cloudRow.tripItem));
+      persistAndQueue('trip_items', data.tripItems.filter(tripItem => tripItem.masterItemId === item.id).map(tripItem => tripItem.id));
     }
   } else {
     item = { id: crypto.randomUUID(), ...values, active: true, sortOrder: Math.max(0, ...data.masterItems.map(candidate => candidate.sortOrder)) + 1 };
     data.masterItems.push(item);
   }
-  await syncMutation('master_items', cloudRow.master(item));
+  persistAndQueue('master_items', item.id);
   ui.view = 'manage';
   ui.editingItemId = null;
   render();
@@ -500,10 +540,8 @@ app.addEventListener('change', async event => {
     item.checked = event.target.checked;
     updateTripStatus(item.tripId);
     const trip = data.trips.find(candidate => candidate.id === item.tripId);
-    await Promise.all([
-      syncMutation('trip_items', cloudRow.tripItem(item)),
-      syncMutation('trips', cloudRow.trip(trip))
-    ]);
+    persistAndQueue('trip_items', item.id);
+    persistAndQueue('trips', trip.id);
   }
   if (action === 'unchecked-only') {
     ui.uncheckedOnly = event.target.checked;
@@ -538,7 +576,7 @@ app.addEventListener('click', async event => {
       data.tripItems = data.tripItems.filter(item => item.tripId !== id);
       if (data.activeTripId === id) data.activeTripId = data.trips[0]?.id || null;
       ui.menuTripId = null;
-      await deleteCloud('trips', id);
+      persistAndQueueDelete('trips', id);
     }
   }
   if (action === 'manage-items') { ui.view = 'manage'; render(); }
@@ -548,7 +586,7 @@ app.addEventListener('click', async event => {
   if (action === 'archive-item') {
     const item = data.masterItems.find(candidate => candidate.id === id);
     item.active = !item.active;
-    await syncMutation('master_items', cloudRow.master(item));
+    persistAndQueue('master_items', item.id);
     ui.view = 'manage';
     ui.editingItemId = null;
     render();
@@ -559,7 +597,7 @@ app.addEventListener('click', async event => {
     const otherIndex = action === 'move-up' ? index - 1 : index + 1;
     if (index >= 0 && otherIndex >= 0 && otherIndex < ordered.length) {
       [ordered[index].sortOrder, ordered[otherIndex].sortOrder] = [ordered[otherIndex].sortOrder, ordered[index].sortOrder];
-      await syncMutation('master_items', [cloudRow.master(ordered[index]), cloudRow.master(ordered[otherIndex])]);
+      persistAndQueue('master_items', [ordered[index].id, ordered[otherIndex].id]);
     }
   }
   if (action === 'sign-in' && supabase) {
@@ -573,6 +611,7 @@ app.addEventListener('click', async event => {
 });
 
 const loadCloudData = async () => {
+  await flushQueue();
   const [masterResult, tripsResult, tripItemsResult] = await Promise.all([
     supabase.from('master_items').select('*').order('sort_order'),
     supabase.from('trips').select('*').order('start_date'),
@@ -583,8 +622,15 @@ const loadCloudData = async () => {
     return;
   }
   if (masterResult.data.length === 0) {
-    data.masterItems = structuredClone(DEFAULT_ITEMS);
-    await supabase.from('master_items').insert(data.masterItems.map(cloudRow.master));
+    const seedRows = structuredClone(DEFAULT_ITEMS);
+    // onConflict + ignoreDuplicates guards against two devices both seeding
+    // the default list the moment the same brand-new account first logs in;
+    // re-select afterwards so both devices converge on whichever rows won.
+    await supabase.from('master_items').upsert(seedRows.map(cloudRow.master), { onConflict: 'user_id,name', ignoreDuplicates: true });
+    const { data: freshMaster } = await supabase.from('master_items').select('*').order('sort_order');
+    data.masterItems = freshMaster?.length
+      ? freshMaster.map(row => ({ id: row.id, name: row.name, category: row.category, bag: row.bag, isOptional: row.is_optional, active: row.is_active, sortOrder: row.sort_order }))
+      : seedRows;
   } else {
     data.masterItems = masterResult.data.map(row => ({ id: row.id, name: row.name, category: row.category, bag: row.bag, isOptional: row.is_optional, active: row.is_active, sortOrder: row.sort_order }));
   }
@@ -611,7 +657,12 @@ const initialize = async () => {
     if (ui.user) await loadCloudData();
     supabase.auth.onAuthStateChange(async (_event, session) => {
       ui.user = session?.user || null;
-      if (ui.user) await loadCloudData();
+      if (ui.user) {
+        await loadCloudData();
+      } else {
+        queue = [];
+        saveQueue();
+      }
       render();
     });
   } catch (error) {
@@ -623,5 +674,5 @@ const initialize = async () => {
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js');
 };
 
-window.addEventListener('online', syncAll);
+window.addEventListener('online', flushQueue);
 initialize();

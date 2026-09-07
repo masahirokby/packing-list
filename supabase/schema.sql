@@ -42,6 +42,11 @@ create table if not exists public.trip_items (
   updated_at timestamptz not null default now()
 );
 
+-- Lets the initial-seed upsert use ON CONFLICT (user_id, name) so two
+-- devices opening a brand-new account at the same time can't both insert
+-- a duplicate copy of the default packing list.
+create unique index if not exists master_items_user_name_key on public.master_items(user_id, name);
+
 create index if not exists master_items_user_order_idx on public.master_items(user_id, sort_order);
 create index if not exists trips_user_start_idx on public.trips(user_id, start_date);
 create index if not exists trip_items_trip_order_idx on public.trip_items(trip_id, sort_order);
