@@ -118,8 +118,7 @@ const ui = {
   editingTripId: null,
   editingItemId: null,
   cloud: false,
-  syncText: '端末内に保存',
-  syncWarn: false,
+  syncFailed: false,
   user: null,
   showInactive: false
 };
@@ -227,11 +226,20 @@ const enqueue = (table, op, id) => {
   saveQueue();
 };
 
+// Single source of truth for the sync indicator: derived fresh on every
+// render from live connectivity + the last attempt's outcome, rather than
+// each call site writing its own text (which drifted into ambiguous wording).
+const syncStatus = () => {
+  if (!ui.cloud) return { text: '💾 端末内に保存', cls: '', dot: null };
+  if (flushing) return { text: '🔄 同期中…', cls: '', dot: null };
+  if (!navigator.onLine) return { text: 'オフライン', cls: 'offline', dot: 'offline' };
+  if (ui.syncFailed) return { text: '同期エラー（データベースが停止中の可能性）', cls: 'warn', dot: 'warn' };
+  return { text: 'オンライン', cls: 'ok', dot: 'ok' };
+};
+
 const flushQueue = async () => {
   if (flushing || !supabase || !ui.user || !navigator.onLine || queue.length === 0) return;
   flushing = true;
-  ui.syncText = '同期中…';
-  ui.syncWarn = false;
   render();
   while (queue.length > 0) {
     const entry = queue[0];
@@ -251,19 +259,10 @@ const flushQueue = async () => {
     queue.shift();
     saveQueue();
   }
-  // A leftover queue while online (not just "haven't reconnected yet") means the
-  // request itself failed server-side — e.g. a paused Supabase project — which
-  // looks identical to being offline unless we check navigator.onLine here.
-  if (queue.length && navigator.onLine) {
-    ui.syncText = '⚠ クラウド同期エラー・端末には保存済み（データベースが停止中の可能性）';
-    ui.syncWarn = true;
-  } else if (queue.length) {
-    ui.syncText = '端末に保存・オフライン中';
-    ui.syncWarn = false;
-  } else {
-    ui.syncText = 'クラウドに保存済み';
-    ui.syncWarn = false;
-  }
+  // flushQueue only reaches here after confirming navigator.onLine at entry,
+  // so a non-empty queue at this point means the request itself failed
+  // (e.g. a paused Supabase project), not that we're offline.
+  ui.syncFailed = queue.length > 0;
   flushing = false;
   render();
 };
@@ -328,6 +327,7 @@ const packingScreen = () => {
         </label>`).join('')}
     </section>`).join('') : '<div class="empty">この表示の未確認項目はありません ✓</div>';
 
+  const status = syncStatus();
   return `
     <section class="screen">
       <header class="hero">
@@ -345,7 +345,7 @@ const packingScreen = () => {
       </nav>
       <div class="toolbar">
         <label class="switch"><input type="checkbox" data-action="unchecked-only" ${ui.uncheckedOnly ? 'checked' : ''}>未確認だけ表示</label>
-        <span class="sync-state ${ui.syncWarn ? 'warn' : ''}">${ui.syncText}</span>
+        <span class="sync-state ${status.cls}">${status.dot ? `<span class="status-dot ${status.dot}"></span>` : ''}${status.text}</span>
       </div>
       <div class="checklist">${listHtml}</div>
     </section>`;
@@ -633,15 +633,9 @@ const loadCloudData = async () => {
     supabase.from('trip_items').select('*').order('sort_order')
   ]);
   if ([masterResult, tripsResult, tripItemsResult].some(result => result.error)) {
-    // Same ambiguity as flushQueue: only call this a real problem (vs. just
-    // being offline) when the browser itself reports a live connection.
-    if (navigator.onLine) {
-      ui.syncText = '⚠ クラウド接続に失敗・端末データを表示中（データベースが停止中の可能性）';
-      ui.syncWarn = true;
-    } else {
-      ui.syncText = '端末データを表示・オフライン中';
-      ui.syncWarn = false;
-    }
+    // syncStatus() itself checks navigator.onLine first, so this only surfaces
+    // as a real "sync error" when we're actually online.
+    ui.syncFailed = true;
     return;
   }
   if (masterResult.data.length === 0) {
@@ -660,7 +654,7 @@ const loadCloudData = async () => {
   data.trips = tripsResult.data.map(row => ({ id: row.id, name: row.name, startDate: row.start_date || '', endDate: row.end_date || '', status: row.status, createdAt: row.created_at }));
   data.tripItems = tripItemsResult.data.map(row => ({ id: row.id, tripId: row.trip_id, masterItemId: row.master_item_id, name: row.name, category: row.category, bag: row.bag, isOptional: row.is_optional, sortOrder: row.sort_order, checked: row.checked }));
   data.activeTripId = data.trips.find(trip => trip.id === data.activeTripId)?.id || data.trips[0]?.id || null;
-  ui.syncText = 'クラウドに保存済み';
+  ui.syncFailed = false;
   saveLocal();
 };
 
@@ -690,18 +684,14 @@ const initialize = async () => {
     });
   } catch (error) {
     console.error(error);
-    ui.cloud = false;
-    if (navigator.onLine) {
-      ui.syncText = '⚠ クラウドに接続できません・端末データを表示中（データベースが停止中の可能性）';
-      ui.syncWarn = true;
-    } else {
-      ui.syncText = '端末内に保存・オフライン中';
-      ui.syncWarn = false;
-    }
+    ui.syncFailed = true;
   }
   render();
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js');
 };
 
-window.addEventListener('online', flushQueue);
+// render() alone (not just flushQueue) so the indicator flips immediately even
+// when there's nothing queued to sync.
+window.addEventListener('online', () => { render(); flushQueue(); });
+window.addEventListener('offline', render);
 initialize();
