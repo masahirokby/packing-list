@@ -119,6 +119,7 @@ const ui = {
   editingItemId: null,
   cloud: false,
   syncText: '端末内に保存',
+  syncWarn: false,
   user: null,
   showInactive: false
 };
@@ -230,6 +231,7 @@ const flushQueue = async () => {
   if (flushing || !supabase || !ui.user || !navigator.onLine || queue.length === 0) return;
   flushing = true;
   ui.syncText = '同期中…';
+  ui.syncWarn = false;
   render();
   while (queue.length > 0) {
     const entry = queue[0];
@@ -249,7 +251,19 @@ const flushQueue = async () => {
     queue.shift();
     saveQueue();
   }
-  ui.syncText = queue.length ? '端末に保存・同期待ち' : 'クラウドに保存済み';
+  // A leftover queue while online (not just "haven't reconnected yet") means the
+  // request itself failed server-side — e.g. a paused Supabase project — which
+  // looks identical to being offline unless we check navigator.onLine here.
+  if (queue.length && navigator.onLine) {
+    ui.syncText = '⚠ クラウド同期エラー・端末には保存済み（データベースが停止中の可能性）';
+    ui.syncWarn = true;
+  } else if (queue.length) {
+    ui.syncText = '端末に保存・オフライン中';
+    ui.syncWarn = false;
+  } else {
+    ui.syncText = 'クラウドに保存済み';
+    ui.syncWarn = false;
+  }
   flushing = false;
   render();
 };
@@ -331,7 +345,7 @@ const packingScreen = () => {
       </nav>
       <div class="toolbar">
         <label class="switch"><input type="checkbox" data-action="unchecked-only" ${ui.uncheckedOnly ? 'checked' : ''}>未確認だけ表示</label>
-        <span class="sync-state">${ui.syncText}</span>
+        <span class="sync-state ${ui.syncWarn ? 'warn' : ''}">${ui.syncText}</span>
       </div>
       <div class="checklist">${listHtml}</div>
     </section>`;
@@ -601,7 +615,8 @@ app.addEventListener('click', async event => {
     }
   }
   if (action === 'sign-in' && supabase) {
-    await supabase.auth.signInWithOAuth({ provider: 'github', options: { redirectTo: location.href.split('#')[0] } });
+    const { error } = await supabase.auth.signInWithOAuth({ provider: 'github', options: { redirectTo: location.href.split('#')[0] } });
+    if (error) alert('ログインに失敗しました。データベースが停止中か、通信状況をご確認ください。');
   }
   if (action === 'sign-out' && supabase) {
     await supabase.auth.signOut();
@@ -618,7 +633,15 @@ const loadCloudData = async () => {
     supabase.from('trip_items').select('*').order('sort_order')
   ]);
   if ([masterResult, tripsResult, tripItemsResult].some(result => result.error)) {
-    ui.syncText = '端末データを表示・同期待ち';
+    // Same ambiguity as flushQueue: only call this a real problem (vs. just
+    // being offline) when the browser itself reports a live connection.
+    if (navigator.onLine) {
+      ui.syncText = '⚠ クラウド接続に失敗・端末データを表示中（データベースが停止中の可能性）';
+      ui.syncWarn = true;
+    } else {
+      ui.syncText = '端末データを表示・オフライン中';
+      ui.syncWarn = false;
+    }
     return;
   }
   if (masterResult.data.length === 0) {
@@ -668,7 +691,13 @@ const initialize = async () => {
   } catch (error) {
     console.error(error);
     ui.cloud = false;
-    ui.syncText = '端末内に保存';
+    if (navigator.onLine) {
+      ui.syncText = '⚠ クラウドに接続できません・端末データを表示中（データベースが停止中の可能性）';
+      ui.syncWarn = true;
+    } else {
+      ui.syncText = '端末内に保存・オフライン中';
+      ui.syncWarn = false;
+    }
   }
   render();
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js');
